@@ -1,0 +1,159 @@
+# Charging park electricity cost model: all parameters.
+#
+# IMPORTANT: the arrival SOC distribution, the PPA price and the synthetic
+# price shape are PLACEHOLDER ASSUMPTIONS, not real data. Vehicle curves come
+# from the Fastned databank (curves section) with equal weight per curve
+# unless representatives.weights_csv is set.
+
+site:
+  charger_kw: 150.0          # DC output rating per charger (used when sessions have no charger_kw column)
+  grid_cap_kw: 500.0         # grid connection limit, grid side
+  # Curves are DC power at the connector. Grid draw = P_dc / charger_efficiency.
+  charger_efficiency: 0.95
+  lm_mode: equal_share       # equal_share (water-filling) | proportional | fifo
+  # Sessions are naive local wall-clock times in this zone. Used to check DST
+  # consistency and to convert timezone-aware price timestamps.
+  local_timezone: Europe/Berlin
+
+sessions:
+  # Modeled calendar year. null = infer from the data (must be a single year).
+  year: null
+  # Sessions longer than this are dropped as implausible. null = no limit.
+  # With the next-day wrap rule the longest possible session is 1440 min.
+  max_duration_min: null
+  columns:
+    date: date
+    arrival_time: arrival_time
+    end_time: end_time
+    charger_kw: charger_kw   # optional column; per-session charger rating
+
+vehicles:
+  target_soc: 0.80
+  # Arrival SOC ~ Beta(a, b). a=2.5, b=7 gives a mean of about 0.26. PLACEHOLDER.
+  arrival_soc_beta: {a: 2.5, b: 7.0}
+  # SOC gain = P_dc x vehicle_efficiency x dt / battery_kwh (DC connector -> cells).
+  vehicle_efficiency: 1.0
+  # Curves reflect about 30 C battery conditions. Optional monthly factor on the
+  # vehicle curve power (Jan..Dec), e.g. 0.8 in cold months. Off by default.
+  temperature_derating:
+    enabled: false
+    monthly_factor: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+
+# Vehicle charging curves (DC power at the connector, kW, SOC 0..100 % in 1 %
+# steps). Fastned curves reflect optimal battery conditions (about 30 C).
+curves:
+  fastned:
+    dir: data/ev_curves/fastned          # contains out/curves_wide.csv + out/vehicles_databank.csv
+    categories: [CAR]                    # CAR | VAN | MOTORCYCLE | PICKUP
+  evkx:
+    enabled: false
+    dir: data/ev_curves/evkx
+    include_estimated: false
+    max_peak_kw: 600.0                   # drop implausible curves above this
+    # ASSUMED layout (the evkx README was not available when this loader was
+    # written): a vehicles file keyed by `id` and a wide curves file with
+    # columns soc_0..soc_100 in kW. Adjust names here once the data is present.
+    vehicles_file: out/vehicles.csv
+    curves_file: out/curves_wide.csv
+    columns:
+      id: vehicle_id
+      brand: brand
+      model: model
+      version: version
+      category: category                 # optional; missing -> category unknown, kept
+      peak_kw: peak_kw
+      capacity_kwh: usable_kwh_0_100
+      curve_quality: curve_quality       # keep "ok" only
+      estimated: estimated               # TRUE -> source evkx_estimated
+      charger_class: charger_class       # optional
+
+# Representative curves: cluster the eligible curves (capped at
+# site.charger_kw) with k-medoids; each medoid is a real curve.
+representatives:
+  # int or "all". Default "all": compare-k on sessions_dummy.csv (2025 DA,
+  # 50 runs) showed every k <= 12 overestimates annual energy vs. "all" by
+  # +1.7 to +3.6 % (medoids skew to larger batteries / higher mid-SOC power),
+  # while runtime does not depend on k. Use a small k for communication
+  # (curves command plots), not for the cost estimate.
+  k: all
+  battery_weight: 1.0                    # weight of battery_kwh next to the kW features
+  feature_soc_step: 5                    # kW at SOC 0, 5, ..., 100 as features
+  seed: 0
+  n_init: 5                              # BUILD start + (n_init - 1) seeded random starts
+  # Optional external member weights, e.g. registrations per model. CSV with
+  # brand, model, weight. A model's weight is split equally over its versions
+  # with curves; a deduplicated curve gets the sum of its group's versions.
+  # Models not in the file get default_weight.
+  weights_csv: null
+  default_weight: 1.0
+  elbow_k_max: 25
+  output_dir: data/processed
+
+prices:
+  # One series per product, EUR/MWh, any resolution <= 1 h (forward-filled to
+  # 15 min). Files: NetCDF (.nc; `variable` + `timestamp` coordinate) or CSV
+  # (`variable` + `timestamp` columns; DA and ID may share one CSV).
+  # timestamps_tz says how to read naive timestamps:
+  #   local       same wall clock as the sessions (site.local_timezone, with DST)
+  #   UTC+01:00   fixed offset, no DST (e.g. CET all year)
+  #   UTC / IANA  any IANA zone name
+  # Timezone-aware timestamps are converted regardless of this setting.
+  # `path` may contain {year}, filled with the modeled year.
+  # DA: SMARD day-ahead, Germany, 15 min, German local time (checked: DST gap
+  # on the March change day, the repeated hour on the October day is averaged).
+  # 2025 complete; 2026 file ends 2026-10-27.
+  da:
+    path: data/prices/DA_{year}_15min_Germany_SMARD.nc
+    variable: EUR per MWh
+    timestamp: time
+    timestamps_tz: local
+  # ID: no data available. null -> use procurement.mode da_only.
+  id:
+    path: null
+    variable: EUR per MWh
+    timestamp: time
+    timestamps_tz: local
+  # Longest gap (in 15-min steps) that may be forward-filled before the
+  # loader raises an error.
+  max_fill_steps: 8
+
+# Shape parameters for SYNTHETIC prices (only with --synthetic-prices).
+# NOT market data; for testing the pipeline only.
+synthetic_prices:
+  seed: 2
+  base_eur_mwh: 85.0
+  seasonal_amp_eur_mwh: 15.0      # winter high, summer low
+  solar_dip_eur_mwh: -35.0        # midday dip, strongest in summer
+  evening_peak_eur_mwh: 30.0      # around 19:00
+  morning_peak_eur_mwh: 15.0      # around 08:00
+  hourly_noise_sd_eur_mwh: 12.0   # DA noise, constant within each hour
+  id_noise_sd_eur_mwh: 15.0       # ID = DA + noise per quarter hour
+
+procurement:
+  # da_only:     PPA covers share_ppa, the rest is bought at DA in the hour it
+  #              is used (perfect forecast; balancing cost not included).
+  #              Needs no ID prices.
+  # fixed_split: every kWh priced at share_da*DA + share_id*ID + share_ppa*PPA
+  # forecast:    PPA covers share_ppa; DA buys an average profile
+  #              (weekday/weekend x quarter hour) of the residual; ID settles
+  #              the deviation (negative ID volume is sold back at the ID price)
+  mode: da_only
+  share_ppa: 0.30
+  share_da: 0.60              # fixed_split only
+  share_id: 0.10              # fixed_split only
+  ppa_price_eur_mwh: 70.0     # PLACEHOLDER
+
+montecarlo:
+  runs: 50
+  seed: 42
+  # A session counts as curtailed when the cap costs it more than this energy.
+  curtailed_tol_kwh: 0.01
+
+output:
+  dir: results
+  colors:
+    green: "#005B4C"
+    blue: "#0000FF"
+    navy: "#00002C"
+    purple: "#6544FE"
+    pink: "#FF7F69"
