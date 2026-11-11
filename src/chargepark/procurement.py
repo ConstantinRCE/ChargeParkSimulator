@@ -25,17 +25,19 @@ def profile_forecast(e_mwh: pd.Series) -> np.ndarray:
     return e_mwh.groupby(key).transform("mean").to_numpy()
 
 
-def price_energy(e_qh_kwh: pd.Series, prices: pd.DataFrame, cfg: dict) -> dict[str, float]:
-    """Cost of buying the 15-min energy series. Returns EUR totals per channel
-    and the volumes (MWh) bought in each."""
+def procurement_breakdown(e_qh_kwh: pd.Series, prices: pd.DataFrame, cfg: dict) -> pd.DataFrame:
+    """Per quarter hour: energy, prices and the volume (kWh) and cost (EUR)
+    bought in each channel. ID volume may be negative (sold back at ID).
+    id_price is NaN when no ID prices are loaded."""
     if not e_qh_kwh.index.equals(prices.index):
         raise ValueError("energy and price series must share the same 15-min index")
     p = cfg["procurement"]
-    e = e_qh_kwh.to_numpy() / 1000.0
-    da = prices["da"].to_numpy()
+    e = e_qh_kwh.to_numpy(float)
+    da = prices["da"].to_numpy(float)
     if p["mode"] != "da_only" and "id" not in prices:
         raise ValueError(f"procurement.mode {p['mode']!r} needs an ID price column")
-    idp = prices["id"].to_numpy() if "id" in prices else np.zeros_like(da)
+    has_id = "id" in prices
+    idp = prices["id"].to_numpy(float) if has_id else np.zeros_like(da)
     s_ppa, ppa_price = p["share_ppa"], p["ppa_price_eur_mwh"]
 
     if p["mode"] == "da_only":
@@ -47,11 +49,25 @@ def price_energy(e_qh_kwh: pd.Series, prices: pd.DataFrame, cfg: dict) -> dict[s
         v_da = profile_forecast(pd.Series(resid, index=e_qh_kwh.index))
         v_id = resid - v_da                     # negative = sold back at ID price
     v_ppa = s_ppa * e
+    c_da, c_id, c_ppa = v_da * da / 1000, v_id * idp / 1000, v_ppa * ppa_price / 1000
+    return pd.DataFrame({
+        "energy_kwh": e, "da_price": da, "id_price": idp if has_id else np.nan,
+        "ppa_volume": v_ppa, "da_volume": v_da, "id_volume": v_id,
+        "cost_da_eur": c_da, "cost_id_eur": c_id, "cost_ppa_eur": c_ppa,
+        "cost_eur": c_da + c_id + c_ppa,
+    }, index=e_qh_kwh.index)
 
-    c_da, c_id, c_ppa = float(v_da @ da), float(v_id @ idp), float(v_ppa.sum() * ppa_price)
+
+def price_energy(e_qh_kwh: pd.Series, prices: pd.DataFrame, cfg: dict) -> dict[str, float]:
+    """Cost of buying the 15-min energy series. Returns EUR totals per channel
+    and the volumes (MWh) bought in each."""
+    b = procurement_breakdown(e_qh_kwh, prices, cfg)
+    c_da, c_id, c_ppa = (float(b[c].sum()) for c in ("cost_da_eur", "cost_id_eur", "cost_ppa_eur"))
     return {
         "cost_eur": c_da + c_id + c_ppa,
         "cost_da_eur": c_da, "cost_id_eur": c_id, "cost_ppa_eur": c_ppa,
-        "vol_da_mwh": float(v_da.sum()), "vol_id_net_mwh": float(v_id.sum()),
-        "vol_id_abs_mwh": float(np.abs(v_id).sum()), "vol_ppa_mwh": float(v_ppa.sum()),
+        "vol_da_mwh": float(b["da_volume"].sum() / 1000),
+        "vol_id_net_mwh": float(b["id_volume"].sum() / 1000),
+        "vol_id_abs_mwh": float(b["id_volume"].abs().sum() / 1000),
+        "vol_ppa_mwh": float(b["ppa_volume"].sum() / 1000),
     }

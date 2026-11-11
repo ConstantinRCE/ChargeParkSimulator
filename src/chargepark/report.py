@@ -114,8 +114,8 @@ def plot_overview(res: MCResult, sessions: pd.DataFrame, cfg: dict, path: str | 
         a.plot(t, getattr(f, key).load_kw[sl], color=col, lw=0.8, label=lab,
                alpha=0.6 if key == "uncapped" else 1.0)
     a.axhline(cap, color=c["pink"], lw=1.5, ls="--", label=f"Grid cap {cap:.0f} kW")
-    a.set_title("Busiest week, 1-min site load (run 1)", loc="left", fontweight="bold")
-    a.set_ylabel("kW")
+    a.set_title(f"Busiest week, 1-min site load (reference run {f.run})", loc="left", fontweight="bold")
+    a.set_ylabel("Grid load (kW)")
     a.legend(loc="upper right", frameon=False, fontsize=8)
     a.tick_params(axis="x", rotation=30)
 
@@ -127,8 +127,8 @@ def plot_overview(res: MCResult, sessions: pd.DataFrame, cfg: dict, path: str | 
     a.axhline(cap, color=c["pink"], lw=1.5, ls="--", label=f"Grid cap {cap:.0f} kW")
     a.set_xlim(0, 3000)
     a.set_title("Load duration curve, 15-min averages (top 3,000 h)", loc="left", fontweight="bold")
-    a.set_xlabel("Hours per year")
-    a.set_ylabel("kW")
+    a.set_xlabel("Hours per year (h)")
+    a.set_ylabel("Grid load (kW)")
     a.legend(frameon=False, fontsize=8)
 
     # (c) energy per session vs plug-in duration
@@ -137,7 +137,7 @@ def plot_overview(res: MCResult, sessions: pd.DataFrame, cfg: dict, path: str | 
     for key, col, lab in series:
         a.scatter(d, getattr(f, key).energy_kwh, s=8, color=col, alpha=0.3, label=lab, linewidths=0)
     a.set_xlim(0, np.percentile(d, 99.5))
-    a.set_title("Energy per session vs. plug-in duration (run 1)", loc="left", fontweight="bold")
+    a.set_title(f"Energy per session vs. plug-in duration (reference run {f.run})", loc="left", fontweight="bold")
     a.set_xlabel("Plug-in duration (min)")
     a.set_ylabel("Grid energy (kWh)")
     a.legend(frameon=False, fontsize=8, markerscale=2)
@@ -153,7 +153,7 @@ def plot_overview(res: MCResult, sessions: pd.DataFrame, cfg: dict, path: str | 
     tag = " (SYNTHETIC prices)" if synthetic_prices else ""
     a.set_title(f"Average energy cost, {len(v)} Monte Carlo runs{tag}", loc="left", fontweight="bold")
     a.set_xlabel("EUR/MWh (energy procurement only)")
-    a.set_ylabel("Runs")
+    a.set_ylabel("Runs (count)")
 
     fig.tight_layout()
     fig.savefig(path, dpi=150)

@@ -51,6 +51,7 @@ def load_config(path: str | Path | None = None, overrides: dict | None = None) -
     r = cfg["representatives"]
     r["output_dir"] = absolute(r["output_dir"])
     r["weights_csv"] = absolute(r["weights_csv"])
+    cfg["output"]["dir"] = absolute(cfg["output"]["dir"])
     return cfg
 
 

@@ -14,8 +14,10 @@ from .vehicles import Catalog, Fleet, sample_fleet
 
 
 @dataclass
-class FirstRun:
-    """Full detail of run 0 for plotting."""
+class ReferenceRun:
+    """Full detail of the reference run: the run whose total cost is closest
+    to the median over runs (ties: lowest run number)."""
+    run: int
     capped: SimResult
     uncapped: SimResult
     fleet: Fleet
@@ -25,7 +27,20 @@ class FirstRun:
 @dataclass
 class MCResult:
     runs: pd.DataFrame         # one row per run
-    first: FirstRun
+    reference: ReferenceRun
+    fleets: list[Fleet]        # sampled fleet per run
+    profiles_kw: np.ndarray    # (runs, quarter hours) float32, mean grid kW per 15 min (capped)
+
+    @property
+    def first(self) -> ReferenceRun:          # backwards compatible name
+        return self.reference
+
+
+def reference_run(runs: pd.DataFrame) -> int:
+    """Run whose total cost is closest to the median (lowest run on ties)."""
+    c = runs["cost_eur"].to_numpy()
+    dev = np.abs(c - np.median(c))
+    return int(runs["run"].to_numpy()[np.flatnonzero(dev == dev.min())[0]])
 
 
 def run_montecarlo(sessions: pd.DataFrame, year: int, prices: pd.DataFrame, cfg: dict,
@@ -39,12 +54,15 @@ def run_montecarlo(sessions: pd.DataFrame, year: int, prices: pd.DataFrame, cfg:
     target = cfg["vehicles"]["target_soc"]
     tol = cfg["montecarlo"]["curtailed_tol_kwh"]
 
-    rows, first = [], None
+    rows, fleets = [], []
+    profiles = np.empty((runs, len(idx15)), np.float32)
     for r in range(runs):
         fleet = sample_fleet(len(sa), catalog, cfg, rng)
+        fleets.append(fleet)
         cap = simulate(sa, fleet, catalog.power_kw, cfg)
         free = simulate(sa, fleet, catalog.power_kw, cfg, grid_cap_kw=np.inf)
         e_qh = to_quarter_hours(cap.load_kw, idx15)
+        profiles[r] = e_qh.to_numpy() * 4
         cost = price_energy(e_qh, prices, cfg)
         e_mwh = cap.energy_kwh.sum() / 1000
         e_free_mwh = free.energy_kwh.sum() / 1000
@@ -63,9 +81,12 @@ def run_montecarlo(sessions: pd.DataFrame, year: int, prices: pd.DataFrame, cfg:
             "avg_cost_eur_mwh": cost["cost_eur"] / e_mwh if e_mwh > 0 else np.nan,
             **cost,
         })
-        if r == 0:
-            first = FirstRun(cap, free, fleet, idx15)
-    return MCResult(pd.DataFrame(rows), first)
+    df = pd.DataFrame(rows)
+    ref = reference_run(df)
+    f = fleets[ref]
+    ref_run = ReferenceRun(ref, simulate(sa, f, catalog.power_kw, cfg),
+                           simulate(sa, f, catalog.power_kw, cfg, grid_cap_kw=np.inf), f, idx15)
+    return MCResult(df, ref_run, fleets, profiles)
 
 
 def compare_k(sessions: pd.DataFrame, year: int, prices: pd.DataFrame, cfg: dict, ks,

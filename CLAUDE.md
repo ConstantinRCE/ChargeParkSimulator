@@ -11,8 +11,13 @@ plug-in duration and by the site grid connection (load management).
   (sessions, prices, synthetic prices), `curves` (charging-curve databanks),
   `representatives` (k-medoids reduction), `vehicles` (catalog + sampling),
   `simulate` (numba core + load management), `procurement`, `montecarlo`
-  (run loop, k comparison), `report` (summary + plots), `cli`.
+  (run loop, reference run, k comparison), `examples` (example-day rules),
+  `results` (writes results/<run_id>/), `report` (summary table +
+  overview.png), `cli`, `plots/` (plot package, see below).
 - CLI: `python -m chargepark run|curves|compare-k ...` (see `cli.py` docstring).
+  `run --plots` also renders the plot set.
+- Plots: `python -m chargepark.plots --run results/<run_id> [--only <section>]
+  [--html] [--workers N] [--no-report]`.
 - Tests: `pytest` in `tests/`. Tests on real data skip if the files are absent.
 - `reference/charging_park_cost.py` is the original prototype (not used).
 
@@ -72,6 +77,74 @@ plug-in duration and by the site grid connection (load management).
 8. Report P10/P50/P90 over runs: energy, energy lost, curtailed sessions,
    binding hours, peak 15-min load, total cost, EUR/MWh.
 
+## Results layout (`results/<run_id>/`)
+`run_id` = `YYYYmmdd-HHMMSS-<8-char sha1 of effective config + inputs>`.
+`output.dir` (or `--out`) is the results root. The plot package reads ONLY
+these files and never re-runs the simulation.
+- `config_snapshot.yaml` effective config (CLI overrides applied),
+  `run_meta.json` (inputs, year, runs, reference_run, synthetic_prices,
+  price_source, k, runtime).
+- `mc_summary.csv` one row per Monte Carlo run (KPIs, cost per channel).
+- `mc_profiles_15min.parquet` timestamp + `run_000..` mean grid kW per 15 min
+  (float32, 0.1 kW) for every run (P10-P90 profile bands).
+- `catalog_curves.parquet` (rep_index, curve_id, name, battery_kwh, share,
+  soc_0..soc_100 DC kW) and `curve_members.parquet` (every eligible curve with
+  its rep_index).
+- Reference run = run whose total cost is closest to the median (ties: lowest
+  run). It is re-simulated after the loop (deterministic, cost checked):
+  - `load_1min.parquet` timestamp, load_kw, load_uncapped_kw,
+    n_active_sessions (plugged in), cap_binding.
+  - `qh.parquet` timestamp, energy_kwh, da_price, id_price (NaN without ID),
+    ppa_volume, da_volume, id_volume (kWh), cost_da/id/ppa_eur, cost_eur.
+  - `sessions.parquet` session_id, start, end, duration_min, charger_kw,
+    (charger_id if in the input), rep_index, representative_curve_id,
+    battery_kwh, soc_arrival, soc_end, energy_kwh, energy_uncapped_kwh (grid
+    side), curtailed, target_reached.
+  - `example_days.csv` rule, label, date, value, unit, reason. Rules:
+    peak_load (highest 1-min load without cap), most_cap_minutes,
+    median_energy, most_expensive (daily cost), most_negative_prices (count of
+    negative DA quarter hours), typical_weekday / typical_weekend (15-min
+    profile with the smallest RMSE to the average). Ties: secondary key, then
+    earliest date. Two rules may pick the same day.
+  - `session_power_examples.parquet` session_id, timestamp, power_kw
+    (allocated grid kW), requested_kw, soc (start of minute) for every minute
+    of every session plugged in on an example day (traced simulation).
+- Also: summary.txt/.csv, vehicle_catalog.csv, overview.png,
+  dropped_sessions.csv (if any).
+
+## Plot catalog (`chargepark.plots`, output `results/plots/<run_id>/`)
+Each plot is one function `f(RunData) -> Figure`, saved as `<name>.pdf` +
+`<name>.png` (200 dpi). `report.pdf` = title page (config, P10/P50/P90 KPIs,
+caveats) + example-day table + all plots in this order. `--html` writes
+`explore.html` (plotly, optional): load and price on a shared zoomable x axis.
+- 01 inputs: arrivals_heatmap, duration_hist, arrivals_hour_of_week,
+  representative_curves, representative_shares, price_heatmap,
+  price_timeseries (year daily / month of most expensive day / week of most
+  negative prices).
+- 02 mechanics: example_day_<rule> (Gantt colored by delivered power above
+  stacked power per session, total without cap, cap line), one per distinct
+  example day; requested_vs_delivered (up to 3 most-curtailed + uncurtailed
+  sessions from the example days, power vs SOC).
+- 03 load: load_year_month, load_example_days (1 min), load_heatmap,
+  cap_share_heatmap, load_duration, cap_monthly, occupancy_heatmap.
+- 04 sessions: soc_distributions, duration_vs_energy, target_by_hour.
+- 05 cost: monthly_cost, weighted_price, daily_profile, load_vs_price.
+- 06 montecarlo: kpi_distributions, convergence, profile_band.
+Style (`plots/style.py`): Arial, fixed categorical order green, blue, purple,
+pink, navy, black; with cap = green, without cap = purple, cap line = black
+dashed; sequential maps white to one hue; prices diverging blue / grey / pink,
+centered at 0. Rules: no second y axis (stacked panels), legend for 2+
+series, units in axis labels, no em dashes, full year aggregated to 15 min or
+coarser, dense layers rasterized. Synthetic prices and placeholder assumptions
+are stated in figure footnotes and on the title page.
+DST: model time is naive local wall-clock time with 24 h every day. Heatmaps
+grey out the nonexistent spring hour; the repeated autumn hour is shown once
+(prices averaged at load time). Both are noted under each heatmap.
+Runtime: about 30 plots render in parallel processes (default min(8, CPUs));
+PDFs use Type 3 fonts (3x faster to write than Type 42). report.pdf merges the
+per-plot PDFs with pypdf. Dummy data: 47 s for the full set on a busy laptop,
+largest plot PDF about 360 kB (01_representative_curves).
+
 ## Choice of k (2025-11-10)
 `compare-k` on `sessions_dummy.csv` with 2025 DA prices, 50 runs each:
 every k in {3, 5, 8, 12} overestimates annual energy vs. k = "all" by +1.7 to
@@ -91,7 +164,8 @@ use k = "all". Small k are for communication (cluster plots), not for costing.
 - `charger_class` is kept in the curve data but not used yet.
 
 ## Conventions
-- Python, numpy/pandas; the minute loop is compiled with numba (`@njit`).
+- Python, numpy/pandas, pyarrow (parquet), pypdf; plotly optional (`.[html]`).
+  The minute loop is compiled with numba (`@njit`).
   Never loop over minutes in plain Python.
 - All parameters in config.yaml, nothing hardcoded in the logic. Relative paths
   in the config resolve against the config file's folder.

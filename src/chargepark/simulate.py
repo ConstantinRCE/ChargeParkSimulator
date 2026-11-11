@@ -82,9 +82,15 @@ def curve_power(curves, v, soc):
 
 @njit(cache=True)
 def _simulate(start_min, end_min, charger_kw, cap_kwh, vtype, curves, soc0, target_soc,
-              charger_eff, vehicle_eff, derate_day, grid_cap_kw, n_minutes, mode, max_active):
+              charger_eff, vehicle_eff, derate_day, grid_cap_kw, n_minutes, mode, max_active,
+              trace_off, tr_p, tr_req, tr_soc):
+    """trace_off[s] >= 0: write session s's minute t (t - start_min[s] rows
+    after trace_off[s]) to tr_p (allocated grid kW), tr_req (requested grid
+    kW) and tr_soc (SOC at the start of the minute)."""
     n_s = start_min.shape[0]
     load = np.zeros(n_minutes)
+    n_active = np.zeros(n_minutes, dtype=np.int32)
+    bind = np.zeros(n_minutes, dtype=np.bool_)
     e_grid = np.zeros(n_s)
     soc = soc0.copy()
     binding = 0
@@ -110,6 +116,7 @@ def _simulate(start_min, end_min, charger_kw, cap_kwh, vtype, curves, soc0, targ
                 active[n_act] = nxt
                 n_act += 1
             nxt += 1
+        n_active[t] = n_act
         if n_act == 0:
             continue
         derate = derate_day[t // 1440]
@@ -124,15 +131,22 @@ def _simulate(start_min, end_min, charger_kw, cap_kwh, vtype, curves, soc0, targ
             req[j] = max(p_dc, 0.0) / charger_eff
         if allocate(req, n_act, grid_cap_kw, mode, alloc):
             binding += 1
+            bind[t] = True
         tot = 0.0
         for j in range(n_act):
             s = active[j]
             p = alloc[j]
+            o = trace_off[s]
+            if o >= 0:
+                k = o + t - start_min[s]
+                tr_p[k] = p
+                tr_req[k] = req[j]
+                tr_soc[k] = soc[s]
             tot += p
             e_grid[s] += p * dt_h
             soc[s] += p * charger_eff * vehicle_eff * dt_h / cap_kwh[s]
         load[t] = tot
-    return load, e_grid, soc, binding
+    return load, e_grid, soc, binding, n_active, bind
 
 
 # =============================================================================
@@ -182,6 +196,20 @@ class SimResult:
     energy_kwh: np.ndarray     # per session, grid side
     soc_end: np.ndarray        # per session
     binding_minutes: int
+    n_active: np.ndarray | None = None      # plugged-in sessions per minute
+    binding: np.ndarray | None = None       # bool per minute: cap binding
+    trace: pd.DataFrame | None = None       # per-minute detail of traced sessions
+
+
+def _trace_layout(sa: "SessionArrays", trace) -> tuple[np.ndarray, np.ndarray]:
+    """Row offsets per session (-1 = not traced) and the traced session ids."""
+    off = np.full(len(sa), -1, np.int64)
+    if trace is None:
+        return off, np.zeros(0, np.int64)
+    ids = np.flatnonzero(np.asarray(trace, bool)) if np.asarray(trace).dtype == bool         else np.unique(np.asarray(trace, np.int64))
+    dur = sa.end_min[ids] - sa.start_min[ids]
+    off[ids] = np.concatenate([[0], np.cumsum(dur)[:-1]]) if len(ids) else []
+    return off, ids
 
 
 def derating_by_day(sa: SessionArrays, cfg: dict) -> np.ndarray:
@@ -197,9 +225,12 @@ def derating_by_day(sa: SessionArrays, cfg: dict) -> np.ndarray:
 
 
 def simulate(sa: SessionArrays, fleet: Fleet, curves_kw: np.ndarray, cfg: dict,
-             grid_cap_kw: float | None = None, lm_mode: str | None = None) -> SimResult:
+             grid_cap_kw: float | None = None, lm_mode: str | None = None,
+             trace=None) -> SimResult:
     """Run one simulation. curves_kw: (types, 101) DC kW, rows indexed by
-    fleet.vtype. grid_cap_kw defaults to cfg; pass np.inf for no cap."""
+    fleet.vtype. grid_cap_kw defaults to cfg; pass np.inf for no cap.
+    trace: session ids (or a bool mask) whose per-minute requested power,
+    allocated power and SOC are returned in SimResult.trace."""
     if len(fleet) != len(sa):
         raise ValueError(f"fleet has {len(fleet)} vehicles for {len(sa)} sessions")
     curves_kw = np.ascontiguousarray(np.atleast_2d(curves_kw), dtype=float)
@@ -209,12 +240,23 @@ def simulate(sa: SessionArrays, fleet: Fleet, curves_kw: np.ndarray, cfg: dict,
         raise ValueError("fleet.vtype out of range for the curve matrix")
     cap = cfg["site"]["grid_cap_kw"] if grid_cap_kw is None else grid_cap_kw
     mode = LM_MODES[lm_mode or cfg["site"]["lm_mode"]]
-    load, e, soc, bind = _simulate(
+    off, ids = _trace_layout(sa, trace)
+    n_tr = int((sa.end_min[ids] - sa.start_min[ids]).sum())
+    tr_p, tr_req, tr_soc = (np.full(n_tr, np.nan) for _ in range(3))
+    load, e, soc, bind, n_active, bind_mask = _simulate(
         sa.start_min, sa.end_min, sa.charger_kw,
         np.ascontiguousarray(fleet.capacity_kwh, float), np.ascontiguousarray(fleet.vtype, np.int64),
         curves_kw, np.ascontiguousarray(fleet.soc0, float),
         float(cfg["vehicles"]["target_soc"]), float(cfg["site"]["charger_efficiency"]),
         float(cfg["vehicles"]["vehicle_efficiency"]), derating_by_day(sa, cfg),
         float(cap), int(sa.n_minutes), mode, max(1, sa.max_concurrency()),
+        off, tr_p, tr_req, tr_soc,
     )
-    return SimResult(load, e, soc, int(bind))
+    tr = None
+    if trace is not None:
+        dur = sa.end_min[ids] - sa.start_min[ids]
+        sid = np.repeat(ids, dur)
+        minute = sa.start_min[sid] + (np.arange(n_tr) - off[sid])
+        tr = pd.DataFrame({"session_id": sid, "minute": minute, "power_kw": tr_p,
+                           "requested_kw": tr_req, "soc": tr_soc})
+    return SimResult(load, e, soc, int(bind), n_active, bind_mask, tr)

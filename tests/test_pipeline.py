@@ -83,11 +83,16 @@ def test_cli_run_end_to_end(small_sessions, tmp_path, tmp_config, capsys):
     rc = main(["--config", str(tmp_config()), "--sessions", str(small_sessions),   # no subcommand = run
                "--synthetic-prices", "--runs", "3", "--k", "4", "--out", str(out)])
     assert rc == 0
-    for f in ("summary.txt", "summary.csv", "montecarlo_runs.csv", "overview.png", "vehicle_catalog.csv"):
-        assert (out / f).exists()
+    (run,) = list(out.iterdir())                                                   # results/<run_id>/
+    assert len(run.name.split("-")[-1]) == 8                                       # config hash
+    for f in ("summary.txt", "summary.csv", "mc_summary.csv", "overview.png", "vehicle_catalog.csv",
+              "config_snapshot.yaml", "run_meta.json", "example_days.csv", "load_1min.parquet",
+              "qh.parquet", "sessions.parquet", "session_power_examples.parquet",
+              "mc_profiles_15min.parquet", "catalog_curves.parquet", "curve_members.parquet"):
+        assert (run / f).exists(), f
     text = capsys.readouterr().out
     assert "SYNTHETIC" in text and "P50" in text and "k = 4" in text
-    assert "—" not in (out / "summary.txt").read_text(encoding="utf-8")   # no em dashes
+    assert "—" not in (run / "summary.txt").read_text(encoding="utf-8")   # no em dashes
 
 
 @needs_fastned

@@ -3,6 +3,8 @@
   python -m chargepark run --sessions data/sessions_dummy.csv
   python -m chargepark run --sessions data/sessions_dummy.csv --k all --runs 20
   python -m chargepark run --sessions data/sessions_dummy.csv --synthetic-prices
+  python -m chargepark run --sessions data/sessions_dummy.csv --plots
+      (results go to <output.dir>/<run_id>/; plots: python -m chargepark.plots --run <dir>)
   python -m chargepark curves --elbow
   python -m chargepark compare-k --sessions data/sessions_dummy.csv --ks all,3,5,8,12
 
@@ -22,6 +24,7 @@ from .io import load_prices, load_sessions, synthetic_prices
 from .montecarlo import compare_k, run_montecarlo
 from .report import format_summary, plot_overview, summary_table, vehicle_info
 from .representatives import build_representatives, elbow, plot_elbow, write_outputs
+from .results import new_run_dir, write_results
 from .vehicles import Catalog
 
 COMMANDS = ("run", "curves", "compare-k")
@@ -46,11 +49,13 @@ def build_parser() -> argparse.ArgumentParser:
             p.add_argument("--synthetic-prices", action="store_true",
                            help="use SYNTHETIC prices instead of the price files (pipeline testing only)")
             p.add_argument("--runs", type=int, help="Monte Carlo runs (overrides config)")
-            p.add_argument("--out", help="output directory (overrides output.dir)")
+            p.add_argument("--out", help="output root directory (overrides output.dir)")
 
     r = sub.add_parser("run", help="Monte Carlo cost run")
     common(r)
-    r.add_argument("--no-plot", action="store_true")
+    r.add_argument("--no-plot", action="store_true", help="skip overview.png")
+    r.add_argument("--plots", action="store_true",
+                   help="also write the full plot set (python -m chargepark.plots)")
 
     c = sub.add_parser("curves", help="build representative curves (and elbow analysis)")
     common(c, sessions=False)
@@ -88,13 +93,22 @@ def cmd_run(args, cfg) -> int:
     vinfo = vehicle_info(rep, cfg)
     print(vinfo)
 
+    catalog = Catalog.from_representatives(rep)
     t0 = time.time()
-    res = run_montecarlo(sessions, srep.year, prices, cfg, Catalog.from_representatives(rep), args.runs)
+    res = run_montecarlo(sessions, srep.year, prices, cfg, catalog, args.runs)
     runtime = time.time() - t0
 
-    out = Path(args.out or cfg["output"]["dir"])
-    out.mkdir(parents=True, exist_ok=True)
-    res.runs.to_csv(out / "montecarlo_runs.csv", index=False)
+    # effective config of this run (CLI overrides applied)
+    cfg["montecarlo"]["runs"] = len(res.runs)
+    for prod, path in (("da", args.prices_da), ("id", args.prices_id)):
+        if path:
+            cfg["prices"][prod]["path"] = str(Path(path).resolve())
+    inputs = {"sessions": str(Path(args.sessions).resolve()), "synthetic_prices": bool(prep.synthetic)}
+    out = new_run_dir(args.out or cfg["output"]["dir"], cfg, inputs)
+    write_results(out, res, sessions, srep.year, prices, cfg, catalog, rep, meta={
+        **inputs, "price_source": prep.source(), "k": rep.k_label, "n_curves": len(rep.curves),
+        "runtime_s": round(runtime, 1), "vehicles": vinfo,
+        "sessions_read": srep.n_read, "sessions_dropped": srep.n_dropped})
     summary_table(res.runs).to_csv(out / "summary.csv")
     rep.table.to_csv(out / "vehicle_catalog.csv", index=False)
     if srep.n_dropped:
@@ -106,6 +120,11 @@ def cmd_run(args, cfg) -> int:
     if not args.no_plot:
         plot_overview(res, sessions, cfg, out / "overview.png", prep.synthetic)
     print(f"\nOutputs written to {out.resolve()}")
+    if args.plots:
+        from .plots.cli import run_plots
+        run_plots(out)
+    else:
+        print(f'Plots: python -m chargepark.plots --run "{out}"')
     return 0
 
 
